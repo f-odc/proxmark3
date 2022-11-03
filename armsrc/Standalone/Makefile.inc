@@ -21,6 +21,14 @@ SRC_STANDALONE = placeholder.c
 ifneq (,$(findstring WITH_STANDALONE_LF_SKELETON,$(APP_CFLAGS)))
     SRC_STANDALONE = lf_skeleton.c
 endif
+# WITH_STANDALONE_HF_BRUTEUID
+ifneq (,$(findstring WITH_STANDALONE_HF_BRUTEUID,$(APP_CFLAGS)))
+    SRC_STANDALONE = hf_bruteuid.c
+endif
+# WITH_STANDALONE_HF_SIMCARD
+ifneq (,$(findstring WITH_STANDALONE_HF_SIMCARD,$(APP_CFLAGS)))
+    SRC_STANDALONE = hf_simcard.c
+endif
 # WITH_STANDALONE_LF_SAMYRUN
 ifneq (,$(findstring WITH_STANDALONE_LF_SAMYRUN,$(APP_CFLAGS)))
     SRC_STANDALONE = lf_samyrun.c

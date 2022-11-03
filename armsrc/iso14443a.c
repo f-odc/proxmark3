@@ -34,7 +34,6 @@
 #include "commonutil.h"
 #include "crc16.h"
 #include "protocols.h"
-#include "generator.h"
 
 #define MAX_ISO14A_TIMEOUT 524288
 
@@ -800,6 +799,228 @@ void RAMFUNC SniffIso14443a(uint8_t param) {
 }
 
 //-----------------------------------------------------------------------------
+// Sniffer modified for IKEA Rothult Replay/Emulation
+// Not callable from Proxmark alone
+//-----------------------------------------------------------------------------
+void RAMFUNC SniffRothultTraffic(uint8_t param, uint8_t *extractedUID, uint8_t *newNdef, bool mastercardFlag) {
+    LEDsoff();
+    // param:
+    // bit 0 - trigger from first card answer
+    // bit 1 - trigger from first reader 7-bit request
+    iso14443a_setup(FPGA_HF_ISO14443A_SNIFFER);
+
+    // Allocate memory from BigBuf for some buffers
+    // free all previous allocations first
+    BigBuf_free();
+    BigBuf_Clear_ext(false);
+    clear_trace();
+    set_tracing(true);
+
+    // The command (reader -> tag) that we're receiving.
+    uint8_t *receivedCmd = BigBuf_malloc(MAX_FRAME_SIZE);
+    uint8_t *receivedCmdPar = BigBuf_malloc(MAX_PARITY_SIZE);
+
+    // The response (tag -> reader) that we're receiving.
+    uint8_t *receivedResp = BigBuf_malloc(MAX_FRAME_SIZE);
+    uint8_t *receivedRespPar = BigBuf_malloc(MAX_PARITY_SIZE);
+
+    uint8_t previous_data = 0;
+    int maxDataLen = 0, dataLen;
+    bool TagIsActive = false;
+    bool ReaderIsActive = false;
+
+    // Set up the demodulator for tag -> reader responses.
+    Demod14aInit(receivedResp, receivedRespPar);
+
+    // Set up the demodulator for the reader -> tag commands
+    Uart14aInit(receivedCmd, receivedCmdPar);
+
+    Dbprintf("Starting to sniff. Press PM3 Button to stop.");
+
+    // The DMA buffer, used to stream samples from the FPGA
+    dmabuf8_t *dma = get_dma8();
+    uint8_t *data = dma->buf;
+
+    // Setup and start DMA.
+    if (FpgaSetupSscDma((uint8_t *) dma->buf, DMA_BUFFER_SIZE) == false) {
+        if (g_dbglevel > 1) Dbprintf("FpgaSetupSscDma failed. Exiting");
+        return;
+    }
+
+    // We won't start recording the frames that we acquire until we trigger;
+    // a good trigger condition to get started is probably when we see a
+    // response from the tag.
+    // triggered == false -- to wait first for card
+    bool triggered = !(param & 0x03);
+
+    uint32_t rx_samples = 0;
+
+    // TODO: insert flag to quit after last sniff message
+    //uint8_t extractedUID[7] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    int partUID = 0;
+    bool infoFound = false;
+    //uint8_t newNdef[31] = {0x00};
+
+    // loop and listen
+    while (BUTTON_PRESS() == false && !infoFound) {
+        WDT_HIT();
+        LED_A_ON();
+
+        register int readBufDataP = data - dma->buf;
+        register int dmaBufDataP = DMA_BUFFER_SIZE - AT91C_BASE_PDC_SSC->PDC_RCR;
+        if (readBufDataP <= dmaBufDataP)
+            dataLen = dmaBufDataP - readBufDataP;
+        else
+            dataLen = DMA_BUFFER_SIZE - readBufDataP + dmaBufDataP;
+
+        // TODO: delete
+        // test for length of buffer
+        if (dataLen > maxDataLen && false) {
+            maxDataLen = dataLen;
+            if (dataLen > (9 * DMA_BUFFER_SIZE / 10)) {
+                Dbprintf("[!] blew circular buffer! | datalen %u", dataLen);
+                break;
+            }
+        }
+        if (dataLen < 1) continue;
+
+        // primary buffer was stopped( <-- we lost data!
+        if (!AT91C_BASE_PDC_SSC->PDC_RCR) {
+            AT91C_BASE_PDC_SSC->PDC_RPR = (uint32_t) dma->buf;
+            AT91C_BASE_PDC_SSC->PDC_RCR = DMA_BUFFER_SIZE;
+            Dbprintf("[-] RxEmpty ERROR | data length %d", dataLen); // temporary
+        }
+        // secondary buffer sets as primary, secondary buffer was stopped
+        if (!AT91C_BASE_PDC_SSC->PDC_RNCR) {
+            AT91C_BASE_PDC_SSC->PDC_RNPR = (uint32_t) dma->buf;
+            AT91C_BASE_PDC_SSC->PDC_RNCR = DMA_BUFFER_SIZE;
+        }
+
+        LED_A_OFF();
+
+        // Need two samples to feed Miller and Manchester-Decoder
+        if (rx_samples & 0x01) {
+
+            if (TagIsActive == false) {        // no need to try decoding reader data if the tag is sending
+                uint8_t readerdata = (previous_data & 0xF0) | (*data >> 4);
+                if (MillerDecoding(readerdata, (rx_samples - 1) * 4)) {
+                    LED_C_ON();
+
+                    // check - if there is a short 7bit request from reader
+                    if ((!triggered) && (param & 0x02) && (Uart.len == 1) && (Uart.bitCount == 7)) triggered = true;
+
+                    if (triggered) {
+                        if (!LogTrace(receivedCmd,
+                                      Uart.len,
+                                      Uart.startTime * 16 - DELAY_READER_AIR2ARM_AS_SNIFFER,
+                                      Uart.endTime * 16 - DELAY_READER_AIR2ARM_AS_SNIFFER,
+                                      Uart.parity,
+                                      true)) break;
+                    }
+                    /* ready to receive another command. */
+                    Uart14aReset();
+                    /* reset the demod code, which might have been */
+                    /* false-triggered by the commands from the reader. */
+                    Demod14aReset();
+                    LED_B_OFF();
+                }
+                ReaderIsActive = (Uart.state != STATE_14A_UNSYNCD);
+            }
+
+            // no need to try decoding tag data if the reader is sending - and we cannot afford the time
+            if (ReaderIsActive == false) {
+                uint8_t tagdata = (previous_data << 4) | (*data & 0x0F);
+                if (ManchesterDecoding(tagdata, 0, (rx_samples - 1) * 4)) {
+                    LED_B_ON();
+                    
+                    // receivedCmd
+                    //Dbhexdump(2, receivedResp, false);
+                    
+                    // Second part of UID message
+                    if(partUID == 2 && mastercardFlag){
+                        // store UID
+                        extractedUID[3] = receivedResp[0];
+                        extractedUID[4] = receivedResp[1];
+                        extractedUID[5] = receivedResp[2];
+                        extractedUID[6] = receivedResp[3];
+                        // Printout stored UID
+                        Dbprintf("Found master keycard with UID:");
+                        Dbhexdump(7, extractedUID, false);
+                        // UID selection is finished
+                        partUID++;
+                    }
+                    // Skip message between both UID messages
+                    if(partUID == 1){
+                        partUID++;
+                    }
+                    // First message containing UID
+                    if(receivedCmd[0] == 147 && receivedCmd[1] == 32){ // 0x93 0x20
+                        // case = mastercard
+                        if(receivedResp[0] == 136 && partUID == 0){ // Starts with 0x88
+                            extractedUID[0] = receivedResp[1];
+                            extractedUID[1] = receivedResp[2];
+                            extractedUID[2] = receivedResp[3];
+                            // insert counter
+                            partUID++;
+                            // set flag to mastercard
+                            mastercardFlag = true;
+                        }else if(!mastercardFlag){ // case = normal tag
+                            Dbprintf("Found tag with UID:");
+                            memcpy(extractedUID, receivedResp, 4);
+                            Dbhexdump(4, extractedUID, false);
+                            // end sniffing
+                            infoFound = true;
+                        }
+                    }
+
+                    // Find last Message for Mastercard
+                    if(receivedCmd[1] == 162 && mastercardFlag){
+                        Dbprintf("Found data payload:");
+                        memcpy(newNdef, receivedResp + 1 , 31);
+                        Dbhexdump(31, newNdef, false);
+                        // End sniffing
+                        infoFound = true;
+                    }
+                    
+
+                    if (!LogTrace(receivedResp,
+                                  Demod.len,
+                                  Demod.startTime * 16 - DELAY_TAG_AIR2ARM_AS_SNIFFER,
+                                  Demod.endTime * 16 - DELAY_TAG_AIR2ARM_AS_SNIFFER,
+                                  Demod.parity,
+                                  false)) break;
+
+                    if ((!triggered) && (param & 0x01)) triggered = true;
+
+                    // ready to receive another response.
+                    Demod14aReset();
+                    // reset the Miller decoder including its (now outdated) input buffer
+                    Uart14aReset();
+                    //Uart14aInit(receivedCmd, receivedCmdPar);
+                    LED_C_OFF();
+                }
+                TagIsActive = (Demod.state != DEMOD_14A_UNSYNCD);
+            }
+        }
+
+        previous_data = *data;
+        rx_samples++;
+        data++;
+        if (data == dma->buf + DMA_BUFFER_SIZE) {
+            data = dma->buf;
+        }
+    } // end main loop
+
+    FpgaDisableTracing();
+
+    // if (g_dbglevel >= DBG_ERROR) {
+    //     Dbprintf("trace len = " _YELLOW_("%d"), BigBuf_get_traceLen());
+    // }
+    switch_off();
+}
+
+
+//-----------------------------------------------------------------------------
 // Prepare tag messages
 //-----------------------------------------------------------------------------
 static void CodeIso14443aAsTagPar(const uint8_t *cmd, uint16_t len, const uint8_t *par, bool collision) {
@@ -928,13 +1149,9 @@ bool GetIso14443aCommandFromReader(uint8_t *received, uint8_t *par, int *len) {
     (void)b;
 
     uint8_t flip = 0;
-    uint16_t checker = 4000;
+    uint16_t checker = 0;
     for (;;) {
-
         WDT_HIT();
-
-        // ever 3 * 4000,  check if we got any data from client
-        // takes long time,  usually messes with simualtion
         if (flip == 3) {
             if (data_available())
                 return false;
@@ -942,14 +1159,14 @@ bool GetIso14443aCommandFromReader(uint8_t *received, uint8_t *par, int *len) {
             flip = 0;
         }
 
-        // button press, takes a bit time, might mess with simualtion
-        if (checker-- == 0) {
+        if (checker >= 3000) {
             if (BUTTON_PRESS())
                 return false;
 
             flip++;
-            checker = 4000;
+            checker = 0;
         }
+        ++checker;
 
         if (AT91C_BASE_SSC->SSC_SR & (AT91C_SSC_RXRDY)) {
             b = (uint8_t)AT91C_BASE_SSC->SSC_RHR;
@@ -1105,7 +1322,6 @@ bool SimulateIso14443aInit(uint8_t tagType, uint16_t flags, uint8_t *data, tag_r
             // READ_SIG
             memcpy(rSIGN, mfu_header->signature, 32);
             AddCrc14A(rSIGN, sizeof(rSIGN) - 2);
-
         }
         break;
         case 8: { // MIFARE Classic 4k
@@ -1644,13 +1860,7 @@ void SimulateIso14443aTag(uint8_t tagType, uint16_t flags, uint8_t *data, uint8_
             // PWD stored in dump now
             uint8_t pwd[4];
             emlGetMemBt(pwd, (pages - 1) * 4 + MFU_DUMP_PREFIX_LENGTH, sizeof(pwd));
-            if (memcmp(pwd, "\x00\x00\x00\x00", 4) == 0) {
-                Uint4byteToMemLe(pwd, ul_ev1_pwdgenB(data));
-                Dbprintf("Calc pwd... %02X %02X %02X %02X", pwd[0], pwd[1], pwd[2], pwd[3]);
-            }
-
             if (memcmp(receivedCmd + 1, pwd, 4) == 0) {
-
                 uint8_t pack[4];
                 emlGetMemBt(pack, pages * 4 + MFU_DUMP_PREFIX_LENGTH, 2);
                 if (memcmp(pack, "\x00\x00\x00\x00", 4) == 0) {
@@ -2453,10 +2663,8 @@ static void iso14a_set_ATS_times(const uint8_t *ats) {
 
 static int GetATQA(uint8_t *resp, uint8_t *resp_par, bool use_ecp, bool use_magsafe) {
 
-#define ECP_DELAY 10
-#define ECP_RETRY_TIMEOUT 100
+#define ECP_DELAY 15
 #define WUPA_RETRY_TIMEOUT 10    // 10ms
-
 
     // 0x26 - REQA
     // 0x52 - WAKE-UP
@@ -2468,25 +2676,15 @@ static int GetATQA(uint8_t *resp, uint8_t *resp_par, bool use_ecp, bool use_mags
         wupa[0] = MAGSAFE_CMD_WUPA_4;
     }
 
-    if (use_ecp) {
-        // In case a device was already selected, we send a S-BLOCK deselect to bring it into an idle state so it can be selected again
-        uint8_t deselect_cmd[] = {0xc2, 0xe0, 0xb4};
-        ReaderTransmit(deselect_cmd, sizeof(deselect_cmd), NULL);
-        // Read response if present
-        (void) ReaderReceive(resp, resp_par);
-    }
-
     uint32_t save_iso14a_timeout = iso14a_get_timeout();
     iso14a_set_timeout(1236 / 128 + 1);  // response to WUPA is expected at exactly 1236/fc. No need to wait longer.
 
-    bool first_try = true;
-    uint32_t retry_timeout = use_ecp ? ECP_RETRY_TIMEOUT : WUPA_RETRY_TIMEOUT;
     uint32_t start_time = GetTickCount();
     int len;
 
     // we may need several tries if we did send an unknown command or a wrong authentication before...
     do {
-        if (use_ecp && !first_try) {
+        if (use_ecp) {
             uint8_t ecp[] = { 0x6a, 0x02, 0xC8, 0x01, 0x00, 0x03, 0x00, 0x02, 0x79, 0x00, 0x00, 0x00, 0x00, 0xC2, 0xD8};
             ReaderTransmit(ecp, sizeof(ecp), NULL);
             SpinDelay(ECP_DELAY);
@@ -2500,13 +2698,12 @@ static int GetATQA(uint8_t *resp, uint8_t *resp_par, bool use_ecp, bool use_mags
             }
         }
 
+
         // Broadcast for a card, WUPA (0x52) will force response from all cards in the field
         ReaderTransmitBitsPar(wupa, 7, NULL, NULL);
         // Receive the ATQA
         len = ReaderReceive(resp, resp_par);
-
-        first_try = false;
-    } while (len == 0 && GetTickCountDelta(start_time) <= retry_timeout);
+    } while (len == 0 && GetTickCountDelta(start_time) <= WUPA_RETRY_TIMEOUT);
 
     iso14a_set_timeout(save_iso14a_timeout);
     return len;

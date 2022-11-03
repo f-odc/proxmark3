@@ -192,6 +192,12 @@ void RunMod(void) {
 
             memcpy(data, stuid, sizeof(stuid));
 
+            // data = UID
+            // responses = empty
+            // cuid = 0
+            // counters[3] = { 0x00, 0x00, 0x00 }
+            // tearings[3] = { 0xbd, 0xbd, 0xbd }
+            // pages = 0
             if (SimulateIso14443aInit(tagType, flags, data, &responses, &cuid, counters, tearings, &pages) == false) {
                 BigBuf_free_keep_EM();
                 reply_ng(CMD_HF_MIFARE_SIMULATE, PM3_EINIT, NULL, 0);
